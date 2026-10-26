@@ -1,0 +1,13 @@
+[package]
+name = "od_provider_macros"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural macros for od_provider"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
