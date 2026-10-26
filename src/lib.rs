@@ -21,9 +21,9 @@
 //!
 //! The generated module also exposes a `Provider` newtype that implements
 //! `Deserialize` itself, by reading a `type` tag out of the value (a map)
-//! and dispatching to the matching registered implementation. The tag stays
-//! in the map the provider is built from, so don't use
-//! `#[serde(deny_unknown_fields)]` on a provider type. It's an
+//! and dispatching to the matching registered implementation. The tag is
+//! removed before the provider is built from the rest of the map, so
+//! provider types can use `#[serde(deny_unknown_fields)]`. It's an
 //! ordinary field type — embed it anywhere in any config struct, at
 //! whatever key path that struct's own `Deserialize` impl puts it.
 //!
@@ -172,12 +172,14 @@ macro_rules! define_provider {
                 {
                     use $crate::__serde::de::Error as _;
 
-                    let value: $crate::Value =
+                    let mut value: $crate::Value =
                         $crate::__serde::Deserialize::deserialize(deserializer)?;
-                    let tag = match &value {
+                    // The tag is removed before the provider is built from
+                    // the rest of the map, so it never shows up as a field.
+                    let tag = match &mut value {
                         $crate::Value::Map(map) => {
-                            match map.get(&$crate::Value::String("type".to_string())) {
-                                Some($crate::Value::String(tag)) => Some(tag.clone()),
+                            match map.remove(&$crate::Value::String("type".to_string())) {
+                                Some($crate::Value::String(tag)) => Some(tag),
                                 _ => None,
                             }
                         }
@@ -360,6 +362,33 @@ mod tests {
         let provider: greeters::Provider =
             serde_yaml::from_str("type: opt\ngreeting: hi").unwrap();
         assert_eq!(provider.greet(), "hi");
+    }
+
+    #[test]
+    fn provider_tag_is_not_passed_as_a_field() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictGreeter {
+            greeting: String,
+        }
+
+        #[provider_impl("strict" for greeters)]
+        impl StrictGreeter {
+            fn greet(&self) -> String {
+                self.greeting.clone()
+            }
+        }
+
+        let provider: greeters::Provider =
+            toml::from_str("type = \"strict\"\ngreeting = \"hey\"").unwrap();
+        assert_eq!(provider.greet(), "hey");
+
+        let err = toml::from_str::<greeters::Provider>(
+            "type = \"strict\"\ngreeting = \"hey\"\nextra = 1",
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("extra"), "{err}");
     }
 
     #[test]
