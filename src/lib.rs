@@ -9,17 +9,21 @@
 //! between them — it avoids deriving a registry type name from the trait
 //! name, and allows nested or renamed registries.
 //!
-//! Every provider is constructed from a `toml::Value` — a provider is, by
-//! definition, something loadable from config: the concrete type must
-//! implement `Deserialize`, and it's built directly from the value that
-//! selected it. Fields that can't be `Deserialize` (trait objects, mutexes,
+//! Every provider is constructed from config — a provider is, by definition,
+//! something loadable from config: the concrete type must implement
+//! `Deserialize`, and it's built directly from the value that selected it.
+//! Nothing here is tied to a particular format: TOML, YAML, JSON or any
+//! other serde data format works, since the selecting value is buffered as a
+//! format-neutral [`Value`] before being handed to the provider. Fields that can't be `Deserialize` (trait objects, mutexes,
 //! open handles) use ordinary serde tooling, not a bespoke escape hatch —
 //! `#[serde(skip)]` (uses `Default::default()`) or `#[serde(skip, default =
 //! "...")]` for a custom default.
 //!
 //! The generated module also exposes a `Provider` newtype that implements
-//! `Deserialize` itself, by reading a `type = "..."` tag out of the value
-//! and dispatching to the matching registered implementation. It's an
+//! `Deserialize` itself, by reading a `type` tag out of the value (a map)
+//! and dispatching to the matching registered implementation. The tag stays
+//! in the map the provider is built from, so don't use
+//! `#[serde(deny_unknown_fields)]` on a provider type. It's an
 //! ordinary field type — embed it anywhere in any config struct, at
 //! whatever key path that struct's own `Deserialize` impl puts it.
 //!
@@ -61,8 +65,9 @@
 //! building its own lookup table at startup.
 //!
 //! Crates using these macros only need to depend on `od_provider` (plus
-//! `serde`, for `#[derive(Deserialize)]`): the generated code reaches
-//! `inventory`, `serde` and `toml` through `od_provider`'s re-exports. The
+//! `serde`, for `#[derive(Deserialize)]`, and whichever format crate they
+//! read config with): the generated code reaches `inventory` and `serde`
+//! through `od_provider`'s re-exports. The
 //! dependency must not be renamed in `Cargo.toml`, since `#[provider_impl]`
 //! emits `::od_provider::...` paths.
 
@@ -72,9 +77,13 @@ extern crate self as od_provider;
 
 pub use od_provider_macros::provider_impl;
 
+/// A format-neutral buffer of deserialized config data, holding the value
+/// that selected a provider until it's handed to that provider.
+pub use serde_value::Value;
+
 /// The error returned when a registered provider can't be built from the
 /// config value that selected it.
-pub type Error = toml::de::Error;
+pub type Error = serde_value::DeserializerError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -82,8 +91,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub use inventory as __inventory;
 #[doc(hidden)]
 pub use serde as __serde;
+
+/// Builds a provider from the value that selected it, naming the offending
+/// field path in the error (`serde_value`'s own errors don't carry it).
 #[doc(hidden)]
-pub use toml as __toml;
+pub fn __deserialize<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
+    serde_path_to_error::deserialize(value).map_err(|err| {
+        let path = err.path().to_string();
+        let inner = err.into_inner();
+        if path == "." {
+            inner
+        } else {
+            <Error as serde::de::Error>::custom(format!("{path}: {inner}"))
+        }
+    })
+}
 
 /// Declares an `inventory`-backed registry module named `$module` for trait
 /// `$trait`.
@@ -93,10 +115,10 @@ pub use toml as __toml;
 ///   registered providers. It must be an actual trait re-export (not a type
 ///   alias) so that downstream code can write `impl $module::Impl for Foo`.
 /// - `Registry` — the `inventory`-collected type; each entry pairs a
-///   provider `name` with a constructor built from a `toml::Value`. Build
+///   provider `name` with a constructor built from a [`Value`]. Build
 ///   one with [`provider_impl`] rather than by hand.
 /// - `Provider` — a `Box<dyn Impl>` newtype that implements `Deserialize`:
-///   it reads a `type = "..."` tag out of the value, looks up the matching
+///   it reads a `type` tag out of the value, looks up the matching
 ///   `Registry` entry by name, and constructs it from the same value.
 ///
 /// Look up a provider by hand with `inventory::iter::<$module::Registry>()`,
@@ -110,18 +132,18 @@ macro_rules! define_provider {
 
             pub struct Registry {
                 pub name: &'static str,
-                constructor: fn($crate::__toml::Value) -> $crate::Result<Box<dyn Impl>>,
+                constructor: fn($crate::Value) -> $crate::Result<Box<dyn Impl>>,
             }
 
             impl Registry {
                 pub const fn new(
                     name: &'static str,
-                    constructor: fn($crate::__toml::Value) -> $crate::Result<Box<dyn Impl>>,
+                    constructor: fn($crate::Value) -> $crate::Result<Box<dyn Impl>>,
                 ) -> Self {
                     Self { name, constructor }
                 }
 
-                pub fn construct(&self, value: $crate::__toml::Value) -> $crate::Result<Box<dyn Impl>> {
+                pub fn construct(&self, value: $crate::Value) -> $crate::Result<Box<dyn Impl>> {
                     (self.constructor)(value)
                 }
             }
@@ -129,7 +151,7 @@ macro_rules! define_provider {
             $crate::__inventory::collect!(Registry);
 
             /// A config-deserializable handle to a registered provider,
-            /// selected by a `type = "..."` tag matching one of the names
+            /// selected by a `type` tag matching one of the names
             /// passed to `#[provider_impl]`. Embed this as a field anywhere
             /// in any `Deserialize` config struct.
             #[allow(dead_code)]
@@ -150,19 +172,25 @@ macro_rules! define_provider {
                 {
                     use $crate::__serde::de::Error as _;
 
-                    let value: $crate::__toml::Value =
+                    let value: $crate::Value =
                         $crate::__serde::Deserialize::deserialize(deserializer)?;
-                    let tag = value
-                        .get("type")
-                        .and_then($crate::__toml::Value::as_str)
+                    let tag = match &value {
+                        $crate::Value::Map(map) => {
+                            match map.get(&$crate::Value::String("type".to_string())) {
+                                Some($crate::Value::String(tag)) => Some(tag.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    let tag = tag
                         .ok_or_else(|| {
                             D::Error::custom(concat!(
                                 "missing `type` field selecting a `",
                                 stringify!($module),
                                 "` provider"
                             ))
-                        })?
-                        .to_string();
+                        })?;
 
                     let entry = $crate::__inventory::iter::<Registry>()
                         .find(|entry| entry.name == tag)
@@ -228,7 +256,7 @@ mod tests {
     fn find_greeter(name: &str) -> Option<Box<dyn greeters::Impl>> {
         inventory::iter::<greeters::Registry>()
             .find(|entry| entry.name == name)
-            .and_then(|entry| entry.construct(toml::Value::Table(Default::default())).ok())
+            .and_then(|entry| entry.construct(crate::Value::Map(Default::default())).ok())
     }
 
     #[test]
@@ -246,7 +274,7 @@ mod tests {
         assert!(find_greeter("missing").is_none());
     }
 
-    // ── deserializing `Provider` directly from a TOML value, tag-dispatched ─
+    // ── deserializing `Provider` from a TOML value, tag-dispatched ──────────
 
     #[test]
     fn provider_deserializes_default_constructor() {
@@ -283,6 +311,65 @@ mod tests {
         assert!(err.to_string().contains("greeting"), "{err}");
     }
 
+    // ── other serde formats: the tag dispatch isn't tied to TOML ────────────
+
+    #[test]
+    fn provider_deserializes_from_yaml() {
+        let provider: greeters::Provider =
+            serde_yaml::from_str("type: fr\ngreeting: hallo").unwrap();
+        assert_eq!(provider.greet(), "hallo");
+    }
+
+    #[test]
+    fn provider_deserializes_from_json() {
+        let provider: greeters::Provider =
+            serde_json::from_str(r#"{"type": "fr", "greeting": "hola"}"#).unwrap();
+        assert_eq!(provider.greet(), "hola");
+    }
+
+    #[test]
+    fn provider_embeds_in_yaml_config() {
+        #[derive(Deserialize)]
+        struct Config {
+            greeters: Vec<greeters::Provider>,
+        }
+
+        let config: Config =
+            serde_yaml::from_str("greeters:\n  - type: en\n  - type: fr\n").unwrap();
+        let greetings: Vec<_> = config.greeters.iter().map(|g| g.greet()).collect();
+        assert_eq!(greetings, ["hello", "bonjour"]);
+    }
+
+    #[test]
+    fn provider_accepts_null_and_option_fields() {
+        #[derive(Deserialize)]
+        struct OptionalGreeter {
+            greeting: Option<String>,
+        }
+
+        #[provider_impl("opt" for greeters)]
+        impl OptionalGreeter {
+            fn greet(&self) -> String {
+                self.greeting.clone().unwrap_or_else(|| "…".to_string())
+            }
+        }
+
+        let provider: greeters::Provider =
+            serde_json::from_str(r#"{"type": "opt", "greeting": null}"#).unwrap();
+        assert_eq!(provider.greet(), "…");
+        let provider: greeters::Provider =
+            serde_yaml::from_str("type: opt\ngreeting: hi").unwrap();
+        assert_eq!(provider.greet(), "hi");
+    }
+
+    #[test]
+    fn provider_deserialize_non_map_errors() {
+        let err = serde_json::from_str::<greeters::Provider>(r#""en""#)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("missing `type`"), "{err}");
+    }
+
     // ── trait referenced via a `crate::...` path ────────────────────────────
 
     pub trait Speaker {
@@ -309,7 +396,7 @@ mod tests {
     fn crate_path_trait_resolves() {
         let found = inventory::iter::<speakers::Registry>()
             .find(|entry| entry.name == "loud")
-            .and_then(|entry| entry.construct(toml::Value::Table(Default::default())).ok())
+            .and_then(|entry| entry.construct(crate::Value::Map(Default::default())).ok())
             .unwrap();
         assert_eq!(found.speak(), "LOUD");
     }
@@ -334,7 +421,7 @@ mod tests {
     fn aliased_trait_resolves() {
         let found = inventory::iter::<aliased_speakers::Registry>()
             .find(|entry| entry.name == "quiet")
-            .and_then(|entry| entry.construct(toml::Value::Table(Default::default())).ok())
+            .and_then(|entry| entry.construct(crate::Value::Map(Default::default())).ok())
             .unwrap();
         assert_eq!(found.speak(), "quiet");
     }

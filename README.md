@@ -3,8 +3,8 @@
 Inventory-backed, config-deserializable provider registries for Rust traits.
 
 `define_provider!` declares a registry module for a trait, and `#[provider_impl]`
-registers implementations into it. The generated `Provider` type deserializes from a
-TOML value by dispatching on its `type = "..."` tag.
+registers implementations into it. The generated `Provider` type deserializes from
+config in any serde format (TOML, YAML, JSON, ...) by dispatching on its `type` tag.
 
 ```toml
 [dependencies]
@@ -33,6 +33,9 @@ impl EnglishGreeter {
 }
 
 let provider: greeters::Provider = toml::from_str(r#"type = "en""#).unwrap();
+assert_eq!(provider.greet(), "hello");
+
+let provider: greeters::Provider = serde_yaml::from_str("type: en").unwrap();
 assert_eq!(provider.greet(), "hello");
 ```
 

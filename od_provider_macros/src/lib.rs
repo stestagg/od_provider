@@ -25,7 +25,7 @@ impl Parse for ProviderArgs {
         if !input.is_empty() {
             return Err(input.error(
                 "unexpected extra tokens; #[provider_impl] takes only `\"name\" for module` — \
-                 the registered type is always built by deserializing the selecting TOML value \
+                 the registered type is always built by deserializing the selecting config value \
                  into `Self`, so use `#[serde(skip, default = \"...\")]` on fields that can't be \
                  `Deserialize` instead of a custom constructor",
             ));
@@ -58,7 +58,7 @@ impl Parse for ProviderArgs {
 /// }
 /// ```
 ///
-/// The provider is always built by deserializing the TOML value that
+/// The provider is always built by deserializing the config value that
 /// selected it directly into `Self` — the concrete type must implement
 /// `serde::de::DeserializeOwned`. For fields that can't be `Deserialize`
 /// (trait objects, mutexes, open handles), use ordinary serde tooling rather
@@ -112,9 +112,9 @@ pub fn provider_impl(args: TokenStream, item: TokenStream) -> TokenStream {
 
     let construct_fn = quote! {
         fn construct(
-            value: ::od_provider::__toml::Value,
+            value: ::od_provider::Value,
         ) -> ::od_provider::Result<Box<dyn #registry_module::Impl>> {
-            let concrete: #self_ty = ::od_provider::__serde::Deserialize::deserialize(value)?;
+            let concrete: #self_ty = ::od_provider::__deserialize(value)?;
             Ok(Box::new(concrete))
         }
     };

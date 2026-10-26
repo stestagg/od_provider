@@ -2,7 +2,7 @@
 name = "od_provider"
 version = "0.1.0"
 edition = "2021"
-description = "Inventory-backed, config-deserializable provider registries for traits"
+description = "Inventory-backed, config-deserializable provider registries for traits (any serde format)"
 
 [workspace]
 members = ["od_provider_macros"]
@@ -11,4 +11,10 @@ members = ["od_provider_macros"]
 od_provider_macros = { path = "od_provider_macros", version = "0.1.0" }
 inventory = "0.3"
 serde = { version = "1", features = ["derive"] }
+serde-value = "0.7"
+serde_path_to_error = "0.1"
+
+[dev-dependencies]
 toml = "0.8"
+serde_json = "1"
+serde_yaml = "0.9"
